@@ -31,14 +31,15 @@ const setChildCacheKey = async (
   cacheKey: string,
   rootKey: RootKey
 ) => {
+  // If there is no root index yet, create a fresh mapping.
   if (!(await storage.has(rootKey))) {
     storage.set(rootKey, { [cacheKey]: 1 });
     return;
   }
   const children = await getChildrenObject(storage, rootKey);
-  if (children[cacheKey]) return;
-  children[cacheKey] = 1;
-  storage.set(rootKey, children);
+  if (children[cacheKey]) return; // already tracked
+  // Write immutably to avoid issues if underlying storage returns frozen/object proxies
+  storage.set(rootKey, { ...children, [cacheKey]: 1 });
 };
 
 const deleteChildCacheKey = async (
@@ -72,11 +73,33 @@ const getChildrenObject = async (storage, rootKey) => {
   if (!rootKey.endsWith(ROOT_KEY_SUFFIX)) {
     throw new Error("Invalid root key");
   }
+  let raw;
   try {
-    return await storage.get(rootKey);
+    raw = await storage.get(rootKey);
   } catch (e) {
     throw new Error("cannot parse children object");
   }
+
+  if (raw == null) return {};
+
+  // Some custom storage implementations may JSON.stringify values (e.g. Redis wrappers)
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed;
+      }
+      throw new Error();
+    } catch {
+      throw new Error("cannot parse children object");
+    }
+  }
+
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("cannot parse children object");
+  }
+
+  return raw;
 };
 
 function copyOriginalMetadataToCacheDescriptor(
@@ -158,7 +181,8 @@ export const Cache =
           const cacheKey = makeParamBasedCacheKey(key, args, paramIndex);
           const rootKey = makeRootKey(key);
           if (paramIndex?.length) {
-            setChildCacheKey(storage, cacheKey, rootKey);
+            // Await so that subsequent bust operations see an up-to-date index even with async storages
+            await setChildCacheKey(storage, cacheKey, rootKey);
           }
 
           if (await storage.has(cacheKey)) return storage.get(cacheKey);
